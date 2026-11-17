@@ -15,5 +15,6 @@ database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
 # Production environment is intentionally left unconfigured until explicit user approval.
-# Secrets (NEVER commit):
+# Secrets (NEVER commit, NEVER place in [vars]):
 #   npx wrangler secret put JWT_SIGNING_SECRET
+#   npx wrangler secret put CODE_HASH_PEPPER

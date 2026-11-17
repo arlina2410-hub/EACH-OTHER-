@@ -26,10 +26,10 @@ object SharingNotificationManager {
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val channel = NotificationChannel(
                 CHANNEL_ID_SHARING,
-                "Active Location Sharing",
+                "Visible Location Mode",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shown while you have explicitly enabled persistent location sharing."
+                description = "Shown while you have enabled visible Foreground Location Mode."
                 setShowBadge(false)
             }
             manager.createNotificationChannel(channel)
@@ -58,8 +58,8 @@ object SharingNotificationManager {
 
         return NotificationCompat.Builder(context, CHANNEL_ID_SHARING)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setContentTitle("EACH OTHER: Location sharing active")
-            .setContentText("Sharing periodic updates with $groupName. Tap to manage.")
+            .setContentTitle("EACH OTHER: Visible location mode on")
+            .setContentText("Consent enabled for $groupName (capture activates in Phase 4). Tap Stop to pause.")
             .setOngoing(true)
             .setContentIntent(openAppIntent)
             .addAction(

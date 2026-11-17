@@ -106,65 +106,70 @@ android/app/src/main/java/com/eachother/app/
 
 ### Key Android Architectural Decisions
 1. **Manual Dependency Injection (`AppContainer`):** Keeps APK size small, build times fast, and avoids kapt/ksp Hilt codegen complexity on entry-level machines while preserving constructor-injected interfaces for unit testing.
-2. **Networking:** **Retrofit + OkHttp + Kotlinx Serialization** (single networking stack, no Ktor alongside it). OkHttp provides battle-tested TLS, connection pooling, and `Authenticator` for seamless 401 token refresh.
-3. **Platform Interfaces:** `LocationSource`, `UsageStatsSource`, `DeviceStatusSource`, `PermissionChecker`, and `Clock` are Kotlin interfaces so every domain use case and ViewModel can be unit-tested on the JVM without Robolectric or a physical phone.
+2. **Networking:** **Retrofit + OkHttp + Kotlinx Serialization** (single networking stack, no Ktor alongside it). OkHttp provides TLS 1.2+ and a lock-coordinated `TokenAuthenticator` so concurrent 401 responses share a single refresh-token rotation without tripping backend reuse detection.
+3. **Keystore Lifecycle & Settings Concurrency:** `AndroidKeystoreAdminKeyManager` generates unique candidate keys (`admin_<uuid>`) during recovery/pairing and cleans up unused keys on failure without overwriting active keys. `KeySecurityLevelMapper` verifies `KeyInfo` hardware vs software status honestly. `AuthRepository` serializes sharing-settings updates with a coroutine `Mutex` and reconciles `409 SETTINGS_VERSION_CONFLICT` responses against authoritative server state.
+4. **Reproducible Gradle Build:** Official **Gradle 8.9** wrapper (`gradlew`, `gradlew.bat`, `gradle/wrapper/gradle-wrapper.jar`, `distributionSha256Sum`) and `gradle/libs.versions.toml` version catalog are committed under `android/`.
+5. **Platform Interfaces:** `PermissionChecker`, `AdminKeySigner`, `SessionStore`, `SharingSettingsStore`, and `Clock` (plus future Phase 3–5 collector interfaces) are Kotlin abstractions for pure-JVM unit testing without Robolectric.
 
 ---
 
-## 3. Recommended Android Dependency Matrix
+## 3. Recommended Android Dependency Matrix (Pinned in `android/gradle/libs.versions.toml`)
 
-> Note: Exact patch versions will be pinned once an Android Gradle / JDK environment is provisioned (see `PHASE_STATUS.md` environment finding). Below is the compatible baseline for **AGP 8.7.x / Kotlin 2.0.21 / Compose BOM 2024.10+ / targetSdk 35**.
-
-| Library | Recommended Version | Purpose |
+| Library | Pinned Version | Purpose |
 | --- | --- | --- |
 | Kotlin | `2.0.21` (with KSP `2.0.21-1.0.27`) | Language + Compose compiler plugin |
-| Android Gradle Plugin | `8.7.3` | Build toolchain (JDK 17 required) |
+| Android Gradle Plugin | `8.7.3` | Build toolchain (Gradle `8.9`, JDK `17` required) |
 | `compileSdk` / `targetSdk` / `minSdk` | `35` / `35` / `26` | Android 8.0+ to Android 15 |
 | Jetpack Compose BOM | `2024.10.01` | Material 3, UI, Navigation Compose |
 | Lifecycle & ViewModel | `2.8.7` | `viewModelScope`, `collectAsStateWithLifecycle` |
-| Room | `2.6.1` (via KSP) | Offline SQLite persistence + auto/manual migrations |
-| WorkManager | `2.10.0` | Network-constrained sync & periodic scheduling |
-| OkHttp | `4.12.0` | HTTPS client, TLS 1.2+, TokenAuthenticator |
+| Room | `2.6.1` (via KSP) | Offline SQLite persistence (activated in Phase 3) |
+| WorkManager | `2.10.0` | Network-constrained sync & periodic scheduling (activated in Phase 3–5) |
+| OkHttp | `4.12.0` | HTTPS client, TLS 1.2+, synchronized `TokenAuthenticator` |
 | Retrofit | `2.11.0` | Typed REST interface |
 | Kotlinx Serialization | `1.7.3` | Zero-reflection JSON serialization |
 | Coroutines | `1.9.0` | Async flows & structured concurrency |
-| Security Crypto / Tink | `androidx.security:security-crypto:1.1.0-alpha06` or Keystore AES-GCM directly | Encrypted token storage (note: wrapping Keystore + DataStore directly avoids deprecated `EncryptedSharedPreferences` alpha warnings—recommended!) |
-| Play Services Location | `com.google.android.gms:play-services-location:21.3.0` | Battery-efficient fused location (behind `LocationSource` fallback) |
-| ZXing Core (`com.google.zxing:core`) | `3.5.3` | Lightweight offline QR code generation (no camera needed for Admin; Connected User can paste code or use system/lightweight scanner if approved) |
-| Testing | JUnit 4 (`4.13.2`), Coroutines Test (`1.9.0`), MockWebServer (`4.12.0`), Room Testing (`2.6.1`) | Automated JVM & instrumented tests |
+| Keystore + DataStore | DataStore `1.1.1` + Keystore AES-256-GCM | Encrypted session storage (avoids deprecated alpha `EncryptedSharedPreferences`) |
+| Play Services Location | `21.3.0` | Fused location provider (wired in Phase 4 behind consent gates) |
+| ZXing Core (`com.google.zxing:core`) | `3.5.3` | Offline QR bitmap generation & Photo Picker QR image decode (zero `CAMERA` permission) |
+| Testing | JUnit 4 (`4.13.2`), Coroutines Test (`1.9.0`), MockWebServer (`4.12.0`) | Automated JVM unit tests |
 
 ---
 
 ## 4. Backend Architecture (Cloudflare Workers + D1)
 
-All backend code will live under `backend/` as a modular TypeScript monolith:
+All backend code lives under `backend/` as a modular TypeScript monolith:
 
 ```text
 backend/
-├── wrangler.toml            # D1 binding, dev/prod environments, compatibility_date
-├── package.json             # wrangler, vitest, @cloudflare/vitest-pool-workers, zod, jose
+├── wrangler.toml            # D1 binding, compatibility_date, secret bindings (JWT_SIGNING_SECRET, CODE_HASH_PEPPER)
+├── package.json             # wrangler, vitest, @cloudflare/vitest-pool-workers, zod
 ├── migrations/
-│   └── 0001_initial_schema.sql
+│   ├── 0001_initial_schema.sql
+│   └── 0002_phase2_1_hardening.sql
 ├── src/
 │   ├── index.ts             # Worker fetch() entrypoint & top-level error boundary
-│   ├── router.ts            # Lightweight typed router (zero heavy framework overhead)
+│   ├── http/                # Typed AppError (with optional structured conflict payload) & JSON responses
 │   ├── middleware/
-│   │   ├── auth.ts          # JWT verification + revocation check against D1
-│   │   ├── rateLimit.ts     # Fixed-window/sliding rate limit (D1 or KV/in-memory fallback)
-│   │   └── requestGuard.ts  # Content-Type, max body size (256 KB), security headers
+│   │   ├── auth.ts          # HS256 JWT verify + D1 session/family/device revocation checks
+│   │   ├── rateLimit.ts     # Atomic single-statement SQL rate-limit buckets + bounded cleanup
+│   │   └── requestGuard.ts  # Content-Type, max body size (256 KB), verified cf-connecting-ip extraction
 │   ├── validation/          # Zod schemas for every endpoint
-│   ├── policy/              # Authorization assertions (assertAdminOwnsGroup, assertDeviceActive)
-│   ├── services/            # AuthService, GroupService, InvitationService, SyncService, DeletionService
-│   ├── repositories/        # D1 prepared-statement queries (strictly parameterized)
-│   └── crypto/              # WebCrypto ECDSA P-256 verify (DER->P1363), SHA-256 token hashing, HS256 JWT signing
+│   ├── services/
+│   │   ├── authService.ts           # ECDSA P-256 challenge/verify, recovery, HMAC code hashes, atomic refresh rotation
+│   │   ├── invitationService.ts     # Single-use Crockford invite codes (HMAC-SHA-256 + optional legacy migration)
+│   │   ├── deviceService.ts         # Monotonic sharing settings (`409` reconciliation), sync-state, device disconnect
+│   │   ├── deletionService.ts       # Pre-delete tombstones across all 4 scopes, ownership-enforced ACKs
+│   │   ├── consentPolicyService.ts  # Authoritative effectiveSharing + Global Pause report enforcement (for Phase 3+)
+│   │   └── quotaService.ts          # Free-tier D1 storage estimation & JSON export
+│   └── crypto/              # WebCrypto ECDSA P-256 verify (DER->P1363), HMAC-SHA-256 code digests, HS256 JWTs
 └── test/
-    ├── auth.test.ts
-    ├── authorization.test.ts
-    ├── sync.test.ts
-    └── deletion.test.ts
+    ├── crypto.test.ts
+    ├── auth_and_isolation.test.ts
+    ├── deletion_and_quota.test.ts
+    └── hardening_phase2_1.test.ts
 ```
 
 ### Why This Backend Fits ₹0 & 10 ms CPU Limits
-- **Zero Heavy Dependencies:** Native WebCrypto (`crypto.subtle`) handles password hashing (PBKDF2-SHA256), SHA-256 token hashing, and JWT signing/verification with minimal bundle size and < 3 ms CPU overhead.
-- **Strict Query Discipline:** Every D1 query uses composite indexes `(device_id, recorded_at)` or `(group_id, created_at)` so row scans stay proportional to returned pages, protecting the 5M rows-read/day free limit.
-- **No Unprotected Endpoints:** Public routes are strictly limited to `/v1/health`, `/v1/auth/admin/register`, `/v1/auth/admin/login`, `/v1/auth/admin/recover`, `/v1/auth/refresh`, `/v1/invitations/validate`, and `/v1/devices/enroll` — all protected by strict Zod validation and rate limiting.
+- **Zero Heavy Dependencies:** Native WebCrypto (`crypto.subtle`) handles ECDSA P-256 signature verification (measured `avg=0.250ms` in `workerd`), HMAC-SHA-256 code hashing, and HS256 JWTs within strict Cloudflare Workers Free CPU budgets.
+- **Strict Query Discipline:** Parameterized SQL and composite indexes keep D1 reads/writes bounded, with bounded expired rate-limit cleanup preventing unbounded table growth.
+- **No Unprotected Endpoints:** Public routes are strictly limited to `/v1/health`, `/v1/auth/admin/register`, `/v1/auth/admin/challenge`, `/v1/auth/admin/verify`, `/v1/auth/admin/recover`, `/v1/auth/admin/devices/enroll`, `/v1/auth/refresh`, `/v1/invitations/validate`, and `/v1/devices/enroll` — all guarded by Zod validation, verified IP/account rate limiting, and fail-closed secrets.

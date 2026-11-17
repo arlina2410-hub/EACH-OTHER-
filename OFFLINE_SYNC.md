@@ -63,11 +63,13 @@ Every record created by a collector on the Connected Device starts in Room with:
 
 Scenario: Connected User's phone is **offline** with 20 queued location points from Nov 16. Meanwhile, the Administrator deletes all Nov 16 location history for that device.
 
-1. **Server Immediate Action (`POST /v1/admin/devices/{id}/deletion-commands`):**
-   - Server deletes matching rows from `location_records` (or `usage_summaries` / `device_status_records`).
-   - Server sets `tombstoned = 1` on any matching `sync_receipts` and inserts a row in `deletion_commands` with `status = 'PENDING_DEVICE_ACK'`.
+1. **Server Immediate Action (`POST /v1/admin/devices/{id}/deletion-commands` or `/v1/devices/me/deletions`):**
+   - Server applies `sync_receipts.tombstoned = 1` **before** deleting rows inside an atomic D1 batch across **all 4 scopes** (`SINGLE_RECORD`, `DATE_RANGE`, `CATEGORY`, `ALL_DEVICE_DATA`) and inserts a `deletion_commands` row (`PENDING_DEVICE_ACK` for active devices).
    - Admin UI displays: **"Deleted from server. Waiting for offline device to confirm local deletion."**
-2. **Connected Device Reconnects:**
+2. **Revoked Device Edge Case (`POST /v1/admin/devices/{id}/disconnect` with `deleteServerData: true`):**
+   - Because disconnecting revokes the device's session immediately, that device can no longer authenticate to `/v1/devices/me/commands` or `/v1/devices/me/commands/ack`.
+   - The server deletes its server-stored data and records **`DEVICE_REVOKED_LOCAL_UNVERIFIED`** (`localWipeGuaranteed: false`), so the Admin UI never falsely claims a remote wipe succeeded on the phone.
+3. **Connected Device Reconnects (Phase 3 Sync Contract):**
    - `SyncWorker` **ALWAYS** executes `GET /v1/devices/me/commands` **before** calling `POST /v1/sync/batch`.
    - For every command returned:
      - `SINGLE_RECORD`: `DELETE FROM local_* WHERE id = :targetRecordId`
@@ -75,10 +77,10 @@ Scenario: Connected User's phone is **offline** with 20 queued location points f
      - `CATEGORY`: `DELETE FROM local_<category>`
      - `ALL_DEVICE_DATA`: `DELETE` all 3 local report tables.
    - Records `commandId` in `local_deletion_log` inside the same Room transaction.
-   - Calls `POST /v1/devices/me/commands/ack` -> Server marks `deletion_commands.status = 'ACKNOWLEDGED'`, `acknowledged_at_ms = now`.
-3. **Race Condition Defense (Server-Side Safety Net):**
-   - Even if a device somehow skips `/commands` or sends an in-flight batch created right as the Admin clicked Delete, `POST /v1/sync/batch` checks `deletion_commands` for that `device_id` where `created_at_ms >= record.recorded_at_ms` (or matching scope/date range/record ID).
-   - Matching items are **never re-inserted** into D1; they are returned in `rejectedTombstonedIds` so the device immediately deletes them locally.
+   - Calls `POST /v1/devices/me/commands/ack` -> Server verifies ownership (`WHERE id = ? AND device_id = ?`), marks legitimate commands `ACKNOWLEDGED`, and returns `{ acknowledgedIds, rejectedCommandIds }`.
+4. **Race Condition Defense (`isRecordTombstoned` Safety Helper):**
+   - Even if a device sends an in-flight batch created offline before a deletion command, `POST /v1/sync/batch` runs `isRecordTombstoned(env, deviceId, recordId, recordType, recordedAtMs)` checking both explicit `sync_receipts.tombstoned = 1` rows AND `deletion_commands` covering that record's scope/date/timestamp (`created_at_ms >= recordedAtMs`).
+   - Matching items are **never re-inserted** into D1; they are returned in `rejectedTombstonedIds` so the device deletes them locally.
 
 ---
 

@@ -1,6 +1,7 @@
 package com.eachother.app.core.network
 
 import com.eachother.app.core.security.SessionStore
+import com.eachother.app.core.security.SharingSettingsStore
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -14,7 +15,11 @@ object NetworkModule {
         encodeDefaults = true
     }
 
-    fun createApi(baseUrl: String, sessionStore: SessionStore): EachOtherApi {
+    fun createApi(
+        baseUrl: String,
+        sessionStore: SessionStore,
+        sharingSettingsStore: SharingSettingsStore? = null
+    ): EachOtherApi {
         val contentType = "application/json".toMediaType()
         val unauthenticatedRetrofit = Retrofit.Builder()
             .baseUrl(baseUrl)
@@ -33,7 +38,7 @@ object NetworkModule {
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .addInterceptor(AuthInterceptor(sessionStore))
-            .authenticator(TokenAuthenticator(sessionStore) { refreshApi })
+            .authenticator(TokenAuthenticator(sessionStore, sharingSettingsStore) { refreshApi })
             .build()
 
         return Retrofit.Builder()

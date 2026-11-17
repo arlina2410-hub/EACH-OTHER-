@@ -1,6 +1,8 @@
 package com.eachother.app.core.network
 
 import com.eachother.app.core.security.SessionStore
+import com.eachother.app.core.security.SharingSettingsStore
+import com.eachother.app.domain.model.AppRole
 import kotlinx.coroutines.runBlocking
 import okhttp3.Authenticator
 import okhttp3.Interceptor
@@ -41,54 +43,80 @@ class AuthInterceptor(
     }
 }
 
+/**
+ * Coordinates concurrent HTTP 401 responses under a single lock so multiple parallel requests
+ * never race to consume the same single-use refresh token and trip backend reuse detection.
+ */
 class TokenAuthenticator(
     private val sessionStore: SessionStore,
+    private val sharingSettingsStore: SharingSettingsStore? = null,
     private val refreshApiProvider: () -> EachOtherApi
 ) : Authenticator {
+    private val refreshLock = Any()
+
     override fun authenticate(route: Route?, response: Response): Request? {
         if (responseCount(response) >= 2) {
             return null
         }
-        val currentSession = runBlocking { sessionStore.getSession() }
-        val refreshToken = currentSession.refreshToken ?: return null
 
-        val refreshResponse = runBlocking {
-            try {
-                refreshApiProvider().refreshToken(RefreshRequest(refreshToken))
-            } catch (_: Exception) {
-                null
+        val failedAuthHeader = response.request.header("Authorization")
+
+        synchronized(refreshLock) {
+            val latestSession = runBlocking { sessionStore.getSession() }
+            if (latestSession.isRevoked) {
+                return null
             }
-        } ?: return null
 
-        if (!refreshResponse.isSuccessful) {
-            if (refreshResponse.code() == 401) {
-                runBlocking {
-                    sessionStore.saveSession(
-                        currentSession.copy(
-                            accessToken = null,
-                            refreshToken = null,
-                            isRevoked = true
-                        )
-                    )
+            // If another thread already rotated the session after this request was sent, retry with the fresh token
+            val currentAccess = latestSession.accessToken
+            if (!currentAccess.isNullOrBlank() && "Bearer $currentAccess" != failedAuthHeader) {
+                return response.request.newBuilder()
+                    .header("Authorization", "Bearer $currentAccess")
+                    .build()
+            }
+
+            val refreshToken = latestSession.refreshToken ?: return null
+            val refreshResponse = runBlocking {
+                try {
+                    refreshApiProvider().refreshToken(RefreshRequest(refreshToken))
+                } catch (_: Exception) {
+                    null
                 }
+            } ?: return null
+
+            if (!refreshResponse.isSuccessful) {
+                if (refreshResponse.code() == 401) {
+                    runBlocking {
+                        if (latestSession.role == AppRole.CONNECTED) {
+                            sharingSettingsStore?.clear()
+                        }
+                        sessionStore.saveSession(
+                            latestSession.copy(
+                                accessToken = null,
+                                refreshToken = null,
+                                isRevoked = true
+                            )
+                        )
+                    }
+                }
+                return null
             }
-            return null
-        }
 
-        val body = refreshResponse.body() ?: return null
-        runBlocking {
-            sessionStore.saveSession(
-                currentSession.copy(
-                    accessToken = body.accessToken,
-                    refreshToken = body.refreshToken,
-                    isRevoked = false
+            val body = refreshResponse.body() ?: return null
+            runBlocking {
+                sessionStore.saveSession(
+                    latestSession.copy(
+                        accessToken = body.accessToken,
+                        refreshToken = body.refreshToken,
+                        isRevoked = false
+                    )
                 )
-            )
-        }
+            }
 
-        return response.request.newBuilder()
-            .header("Authorization", "Bearer ${body.accessToken}")
-            .build()
+            return response.request.newBuilder()
+                .header("Authorization", "Bearer ${body.accessToken}")
+                .build()
+        }
     }
 
     private fun responseCount(response: Response): Int {

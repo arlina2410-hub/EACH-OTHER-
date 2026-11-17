@@ -2,6 +2,7 @@ import {
   canonicalChallengeMessage,
   generateInviteCode,
   generateRecoveryCodes,
+  hmacSha256CodeDigest,
   importP256SpkiPublicKey,
   normalizeCode,
   randomBytes,
@@ -22,6 +23,18 @@ function formatCode12(raw12: string): string {
   return `${raw12.slice(0, 4)}-${raw12.slice(4, 8)}-${raw12.slice(8, 12)}`;
 }
 
+async function digestProtectedCode(
+  env: Env,
+  domain: 'recovery-v1' | 'admin-pair-v1',
+  normalizedCode: string
+): Promise<string> {
+  try {
+    return await hmacSha256CodeDigest(env.CODE_HASH_PEPPER, domain, normalizedCode);
+  } catch {
+    throw new AppError(500, 'SERVER_MISCONFIGURED', 'Required code hashing secret is not configured.');
+  }
+}
+
 export async function issueSessionTokens(
   env: Env,
   params: {
@@ -31,19 +44,44 @@ export async function issueSessionTokens(
     deviceId: string | null;
     groupId: string;
     nowMs: number;
+    familyId?: string;
+    sessionId?: string;
   }
 ) {
-  const sessionId = crypto.randomUUID();
+  const sessionId = params.sessionId ?? crypto.randomUUID();
+  const isNewFamily = !params.familyId;
+  const familyId = params.familyId ?? crypto.randomUUID();
   const rawRefresh = toBase64Url(randomBytes(32));
   const refreshHash = await sha256Hex(rawRefresh);
   const refreshTtl = params.subjectType === 'ADMIN' ? ADMIN_REFRESH_TTL_MS : DEVICE_REFRESH_TTL_MS;
 
-  await env.DB.prepare(
+  if (isNewFamily) {
+    await env.DB.prepare(
+      `INSERT INTO auth_session_families (
+         id, subject_type, account_id, admin_device_id, device_id, created_at_ms, revoked_at_ms, revoked_reason
+       )
+       VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`
+    )
+      .bind(
+        familyId,
+        params.subjectType,
+        params.accountId,
+        params.adminDeviceId,
+        params.deviceId,
+        params.nowMs
+      )
+      .run();
+  }
+
+  const insertRes = await env.DB.prepare(
     `INSERT INTO auth_sessions (
-       id, subject_type, account_id, admin_device_id, device_id, group_id,
-       refresh_token_hash, expires_at_ms, revoked_at_ms, created_at_ms, last_used_at_ms
+       id, family_id, subject_type, account_id, admin_device_id, device_id, group_id,
+       refresh_token_hash, expires_at_ms, revoked_at_ms, rotated_at_ms, replaced_by_session_id,
+       created_at_ms, last_used_at_ms
      )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+     SELECT ?, f.id, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?
+     FROM auth_session_families f
+     WHERE f.id = ? AND f.revoked_at_ms IS NULL`
   )
     .bind(
       sessionId,
@@ -55,9 +93,14 @@ export async function issueSessionTokens(
       refreshHash,
       params.nowMs + refreshTtl,
       params.nowMs,
-      params.nowMs
+      params.nowMs,
+      familyId
     )
     .run();
+
+  if ((insertRes.meta.changes ?? 0) !== 1) {
+    throw new AppError(401, 'REFRESH_TOKEN_REUSED', 'Session revoked due to token reuse.');
+  }
 
   const iatSec = Math.floor(params.nowMs / 1000);
   const accessToken = await signJwt(
@@ -109,6 +152,11 @@ export async function registerAdmin(
   const adminDeviceId = crypto.randomUUID();
   const recoveryCodes = generateRecoveryCodes(10);
 
+  // Pre-hash with required server pepper BEFORE inserting account/group so missing pepper fails atomically
+  const codeDigests = await Promise.all(
+    recoveryCodes.map((code) => digestProtectedCode(env, 'recovery-v1', normalizeCode(code)))
+  );
+
   const stmts: D1PreparedStatement[] = [
     env.DB.prepare(
       `INSERT INTO accounts (id, email, status, created_at_ms, updated_at_ms)
@@ -124,8 +172,7 @@ export async function registerAdmin(
     ).bind(adminDeviceId, accountId, groupId, input.deviceName, input.publicKeySpki.trim(), nowMs, nowMs),
   ];
 
-  for (const code of recoveryCodes) {
-    const codeHash = await sha256Hex(normalizeCode(code));
+  for (const codeHash of codeDigests) {
     stmts.push(
       env.DB.prepare(
         `INSERT INTO account_recovery_codes (id, account_id, code_hash, used_at_ms, created_at_ms)
@@ -312,25 +359,32 @@ export async function recoverAdminAccount(
     throw new AppError(400, 'INVALID_PUBLIC_KEY', 'newPublicKeySpki must be a valid Base64 ECDSA P-256 SPKI key.');
   }
 
+  const normalized = normalizeCode(input.recoveryCode);
+  // Compute peppered digest first so missing CODE_HASH_PEPPER always fails closed
+  const primaryHash = await digestProtectedCode(env, 'recovery-v1', normalized);
+
   const account = await env.DB.prepare('SELECT id, status FROM accounts WHERE email = ?')
     .bind(input.email)
     .first<{ id: string; status: string }>();
 
-  if (!account || account.status !== 'ACTIVE') {
+  if (!account || account.status !== 'ACTIVE' || normalized.length !== 12) {
     throw new AppError(401, 'RECOVERY_FAILED', 'Invalid recovery credentials.');
   }
 
-  const normalized = normalizeCode(input.recoveryCode);
-  if (normalized.length !== 12) {
-    throw new AppError(401, 'RECOVERY_FAILED', 'Invalid recovery credentials.');
-  }
-  const codeHash = await sha256Hex(normalized);
-
-  const codeRow = await env.DB.prepare(
+  let codeRow = await env.DB.prepare(
     'SELECT id FROM account_recovery_codes WHERE account_id = ? AND code_hash = ? AND used_at_ms IS NULL'
   )
-    .bind(account.id, codeHash)
+    .bind(account.id, primaryHash)
     .first<{ id: string }>();
+
+  if (!codeRow && env.ALLOW_LEGACY_UNPEPPERED_CODES === 'true') {
+    const legacyHash = await sha256Hex(normalized);
+    codeRow = await env.DB.prepare(
+      'SELECT id FROM account_recovery_codes WHERE account_id = ? AND code_hash = ? AND used_at_ms IS NULL'
+    )
+      .bind(account.id, legacyHash)
+      .first<{ id: string }>();
+  }
 
   if (!codeRow) {
     throw new AppError(401, 'RECOVERY_FAILED', 'Invalid recovery credentials.');
@@ -364,7 +418,12 @@ export async function recoverAdminAccount(
        WHERE account_id = ? AND status = 'ACTIVE'`
     ).bind(nowMs, account.id),
     env.DB.prepare(
-      `UPDATE auth_sessions SET revoked_at_ms = ? WHERE account_id = ? AND revoked_at_ms IS NULL`
+      'UPDATE auth_sessions SET revoked_at_ms = ? WHERE account_id = ? AND revoked_at_ms IS NULL'
+    ).bind(nowMs, account.id),
+    env.DB.prepare(
+      `UPDATE auth_session_families
+       SET revoked_at_ms = ?, revoked_reason = COALESCE(revoked_reason, 'ACCOUNT_RECOVERY')
+       WHERE account_id = ? AND revoked_at_ms IS NULL`
     ).bind(nowMs, account.id),
     env.DB.prepare(
       `UPDATE admin_pairing_invites SET revoked_at_ms = COALESCE(revoked_at_ms, ?)
@@ -412,7 +471,7 @@ export async function createAdminPairingInvite(
   nowMs: number = Date.now()
 ) {
   const rawCode = generateInviteCode(12);
-  const tokenHash = await sha256Hex(rawCode);
+  const tokenHash = await digestProtectedCode(env, 'admin-pair-v1', rawCode);
   const pairingInviteId = crypto.randomUUID();
   const expiresAtMs = nowMs + params.ttlMinutes * 60 * 1000;
 
@@ -443,19 +502,20 @@ export async function enrollAdditionalAdminDevice(
   }
 
   const normalized = normalizeCode(input.pairingCode);
+  const tokenHash = await digestProtectedCode(env, 'admin-pair-v1', normalized);
+
   if (normalized.length !== 12) {
     throw new AppError(404, 'PAIRING_INVALID', 'Administrator pairing code is invalid, expired, or used.');
   }
-  const tokenHash = await sha256Hex(normalized);
 
-  const invite = await env.DB.prepare(
-    `SELECT p.id, p.account_id, p.group_id, p.expires_at_ms, p.used_at_ms, p.revoked_at_ms,
+  const pairingQuery = `SELECT p.id, p.account_id, p.group_id, p.expires_at_ms, p.used_at_ms, p.revoked_at_ms,
             a.status AS account_status, g.name AS group_name, g.status AS group_status
      FROM admin_pairing_invites p
      JOIN accounts a ON a.id = p.account_id
      JOIN groups g ON g.id = p.group_id
-     WHERE p.token_hash = ?`
-  )
+     WHERE p.token_hash = ?`;
+
+  let invite = await env.DB.prepare(pairingQuery)
     .bind(tokenHash)
     .first<{
       id: string;
@@ -468,6 +528,23 @@ export async function enrollAdditionalAdminDevice(
       group_name: string;
       group_status: string;
     }>();
+
+  if (!invite && env.ALLOW_LEGACY_UNPEPPERED_CODES === 'true') {
+    const legacyHash = await sha256Hex(normalized);
+    invite = await env.DB.prepare(pairingQuery)
+      .bind(legacyHash)
+      .first<{
+        id: string;
+        account_id: string;
+        group_id: string;
+        expires_at_ms: number;
+        used_at_ms: number | null;
+        revoked_at_ms: number | null;
+        account_status: string;
+        group_name: string;
+        group_status: string;
+      }>();
+  }
 
   if (
     !invite ||
@@ -582,6 +659,11 @@ export async function revokeRegisteredAdminDevice(
     env.DB.prepare(
       'UPDATE auth_sessions SET revoked_at_ms = ? WHERE admin_device_id = ? AND revoked_at_ms IS NULL'
     ).bind(nowMs, targetAdminDeviceId),
+    env.DB.prepare(
+      `UPDATE auth_session_families
+       SET revoked_at_ms = ?, revoked_reason = COALESCE(revoked_reason, 'ADMIN_DEVICE_REVOKED')
+       WHERE admin_device_id = ? AND revoked_at_ms IS NULL`
+    ).bind(nowMs, targetAdminDeviceId),
   ]);
 
   return {
@@ -597,14 +679,17 @@ export async function regenerateRecoveryCodes(
   nowMs: number = Date.now()
 ) {
   const newCodes = generateRecoveryCodes(10);
+  const codeDigests = await Promise.all(
+    newCodes.map((code) => digestProtectedCode(env, 'recovery-v1', normalizeCode(code)))
+  );
+
   const stmts: D1PreparedStatement[] = [
     env.DB.prepare(
       'DELETE FROM account_recovery_codes WHERE account_id = ? AND used_at_ms IS NULL'
     ).bind(accountId),
   ];
 
-  for (const code of newCodes) {
-    const codeHash = await sha256Hex(normalizeCode(code));
+  for (const codeHash of codeDigests) {
     stmts.push(
       env.DB.prepare(
         `INSERT INTO account_recovery_codes (id, account_id, code_hash, used_at_ms, created_at_ms)
@@ -617,6 +702,48 @@ export async function regenerateRecoveryCodes(
   return { recoveryCodes: newCodes };
 }
 
+async function revokeSessionFamily(
+  env: Env,
+  session: {
+    id: string;
+    family_id: string | null;
+    subject_type: 'ADMIN' | 'DEVICE';
+    account_id: string | null;
+    admin_device_id: string | null;
+    device_id: string | null;
+  },
+  nowMs: number
+) {
+  if (session.family_id) {
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE auth_session_families
+         SET revoked_at_ms = COALESCE(revoked_at_ms, ?),
+             revoked_reason = COALESCE(revoked_reason, 'REFRESH_TOKEN_REUSED')
+         WHERE id = ?`
+      ).bind(nowMs, session.family_id),
+      env.DB.prepare(
+        'UPDATE auth_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, ?) WHERE family_id = ?'
+      ).bind(nowMs, session.family_id),
+    ]);
+    return;
+  }
+
+  if (session.subject_type === 'ADMIN' && session.admin_device_id) {
+    await env.DB.prepare(
+      'UPDATE auth_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, ?) WHERE admin_device_id = ?'
+    )
+      .bind(nowMs, session.admin_device_id)
+      .run();
+  } else if (session.device_id) {
+    await env.DB.prepare(
+      'UPDATE auth_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, ?) WHERE device_id = ?'
+    )
+      .bind(nowMs, session.device_id)
+      .run();
+  }
+}
+
 export async function refreshAuthSession(
   env: Env,
   refreshToken: string,
@@ -624,12 +751,17 @@ export async function refreshAuthSession(
 ) {
   const hash = await sha256Hex(refreshToken);
   const session = await env.DB.prepare(
-    `SELECT id, subject_type, account_id, admin_device_id, device_id, group_id, expires_at_ms, revoked_at_ms
-     FROM auth_sessions WHERE refresh_token_hash = ?`
+    `SELECT s.id, s.family_id, s.subject_type, s.account_id, s.admin_device_id, s.device_id,
+            s.group_id, s.expires_at_ms, s.revoked_at_ms, s.rotated_at_ms,
+            f.revoked_at_ms AS family_revoked_at_ms
+     FROM auth_sessions s
+     LEFT JOIN auth_session_families f ON f.id = s.family_id
+     WHERE s.refresh_token_hash = ?`
   )
     .bind(hash)
     .first<{
       id: string;
+      family_id: string | null;
       subject_type: 'ADMIN' | 'DEVICE';
       account_id: string | null;
       admin_device_id: string | null;
@@ -637,27 +769,22 @@ export async function refreshAuthSession(
       group_id: string;
       expires_at_ms: number;
       revoked_at_ms: number | null;
+      rotated_at_ms: number | null;
+      family_revoked_at_ms: number | null;
     }>();
 
   if (!session) {
     throw new AppError(401, 'INVALID_REFRESH_TOKEN', 'Refresh token is invalid.');
   }
 
-  if (session.revoked_at_ms !== null) {
-    if (session.subject_type === 'ADMIN' && session.account_id) {
-      await env.DB.prepare(
-        'UPDATE auth_sessions SET revoked_at_ms = ? WHERE account_id = ? AND revoked_at_ms IS NULL'
-      )
-        .bind(nowMs, session.account_id)
-        .run();
-    } else if (session.device_id) {
-      await env.DB.prepare(
-        'UPDATE auth_sessions SET revoked_at_ms = ? WHERE device_id = ? AND revoked_at_ms IS NULL'
-      )
-        .bind(nowMs, session.device_id)
-        .run();
-    }
-    throw new AppError(401, 'REFRESH_TOKEN_REUSED', 'Session revoked due to token reuse.');
+  // Distinct handling: reused (already rotated), explicitly revoked, and expired
+  if (session.rotated_at_ms !== null) {
+    await revokeSessionFamily(env, session, nowMs);
+    throw new AppError(401, 'REFRESH_TOKEN_REUSED', 'Session revoked due to refresh token reuse.');
+  }
+
+  if (session.revoked_at_ms !== null || session.family_revoked_at_ms !== null) {
+    throw new AppError(401, 'REFRESH_TOKEN_REVOKED', 'Refresh token has been revoked.');
   }
 
   if (session.expires_at_ms <= nowMs) {
@@ -685,9 +812,32 @@ export async function refreshAuthSession(
     }
   }
 
-  await env.DB.prepare('UPDATE auth_sessions SET revoked_at_ms = ?, last_used_at_ms = ? WHERE id = ?')
-    .bind(nowMs, nowMs, session.id)
+  const nextSessionId = crypto.randomUUID();
+  const claim = await env.DB.prepare(
+    `UPDATE auth_sessions
+     SET rotated_at_ms = ?, revoked_at_ms = ?, last_used_at_ms = ?, replaced_by_session_id = ?
+     WHERE id = ? AND rotated_at_ms IS NULL AND revoked_at_ms IS NULL AND expires_at_ms > ?`
+  )
+    .bind(nowMs, nowMs, nowMs, nextSessionId, session.id, nowMs)
     .run();
+
+  if ((claim.meta.changes ?? 0) !== 1) {
+    // Re-read authoritative row state after losing the atomic claim race
+    const latest = await env.DB.prepare(
+      'SELECT rotated_at_ms, revoked_at_ms, expires_at_ms FROM auth_sessions WHERE id = ?'
+    )
+      .bind(session.id)
+      .first<{ rotated_at_ms: number | null; revoked_at_ms: number | null; expires_at_ms: number }>();
+
+    if (latest?.rotated_at_ms !== null) {
+      await revokeSessionFamily(env, session, nowMs);
+      throw new AppError(401, 'REFRESH_TOKEN_REUSED', 'Session revoked due to concurrent refresh token reuse.');
+    }
+    if (latest?.revoked_at_ms !== null) {
+      throw new AppError(401, 'REFRESH_TOKEN_REVOKED', 'Refresh token has been revoked.');
+    }
+    throw new AppError(401, 'REFRESH_TOKEN_EXPIRED', 'Refresh token has expired.');
+  }
 
   return issueSessionTokens(env, {
     subjectType: session.subject_type,
@@ -696,5 +846,7 @@ export async function refreshAuthSession(
     deviceId: session.device_id,
     groupId: session.group_id,
     nowMs,
+    familyId: session.family_id ?? undefined,
+    sessionId: nextSessionId,
   });
 }

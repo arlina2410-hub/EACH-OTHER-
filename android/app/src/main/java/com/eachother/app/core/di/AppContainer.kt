@@ -23,7 +23,7 @@ class AppContainer(context: Context) {
     val sessionStore: SessionStore = KeystoreSessionStore(appContext)
     val sharingSettingsStore: SharingSettingsStore = DataStoreSharingSettingsStore(appContext)
     val adminKeySigner: AdminKeySigner = AndroidKeystoreAdminKeyManager()
-    val api: EachOtherApi = NetworkModule.createApi(BuildConfig.API_BASE_URL, sessionStore)
+    val api: EachOtherApi = NetworkModule.createApi(BuildConfig.API_BASE_URL, sessionStore, sharingSettingsStore)
     val authRepository: AuthRepository = AuthRepository(
         api = api,
         sessionStore = sessionStore,

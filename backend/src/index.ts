@@ -76,56 +76,57 @@ export default {
 
       // --- Public Auth & Enrollment ---
       if (method === 'POST' && path === '/v1/auth/admin/register') {
-        await enforceRateLimit(env.DB, 'admin_register', ipKey, 5, 60 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'admin_register', ipKey, 5, 60 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, adminRegisterSchema);
         const result = await registerAdmin(env, body);
         return jsonResponse(result, 201);
       }
 
       if (method === 'POST' && path === '/v1/auth/admin/challenge') {
-        await enforceRateLimit(env.DB, 'admin_challenge', ipKey, 20, 15 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'admin_challenge', ipKey, 20, 15 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, adminChallengeSchema);
         const result = await createAdminChallenge(env, body);
         return jsonResponse(result, 200);
       }
 
       if (method === 'POST' && path === '/v1/auth/admin/verify') {
-        await enforceRateLimit(env.DB, 'admin_verify', ipKey, 20, 15 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'admin_verify', ipKey, 20, 15 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, adminVerifySchema);
         const result = await verifyAdminChallenge(env, body);
         return jsonResponse(result, 200);
       }
 
       if (method === 'POST' && path === '/v1/auth/admin/recover') {
-        await enforceRateLimit(env.DB, 'admin_recover', ipKey, 5, 60 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'admin_recover', ipKey, 5, 60 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, adminRecoverSchema);
+        await enforceRateLimit(env.DB, 'admin_recover_acct', body.email, 5, 60 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const result = await recoverAdminAccount(env, body);
         return jsonResponse(result, 200);
       }
 
       if (method === 'POST' && path === '/v1/auth/admin/devices/enroll') {
-        await enforceRateLimit(env.DB, 'admin_device_enroll', ipKey, 10, 15 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'admin_device_enroll', ipKey, 10, 15 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, adminDeviceEnrollSchema);
         const result = await enrollAdditionalAdminDevice(env, body);
         return jsonResponse(result, 201);
       }
 
       if (method === 'POST' && path === '/v1/auth/refresh') {
-        await enforceRateLimit(env.DB, 'auth_refresh', ipKey, 30, 15 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'auth_refresh', ipKey, 30, 15 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, refreshSchema);
         const result = await refreshAuthSession(env, body.refreshToken);
         return jsonResponse(result, 200);
       }
 
       if (method === 'POST' && path === '/v1/invitations/validate') {
-        await enforceRateLimit(env.DB, 'invite_validate', ipKey, 10, 15 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'invite_validate', ipKey, 10, 15 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, validateInvitationSchema);
         const result = await validateInvitation(env, body.inviteCode);
         return jsonResponse(result, 200);
       }
 
       if (method === 'POST' && path === '/v1/devices/enroll') {
-        await enforceRateLimit(env.DB, 'device_enroll', ipKey, 10, 15 * 60 * 1000);
+        await enforceRateLimit(env.DB, 'device_enroll', ipKey, 10, 15 * 60 * 1000, env.JWT_SIGNING_SECRET);
         const body = await parseJsonBody(request, enrollDeviceSchema);
         const result = await enrollDevice(env, body);
         return jsonResponse(result, 201);

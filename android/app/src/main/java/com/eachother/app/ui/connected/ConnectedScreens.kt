@@ -208,6 +208,7 @@ fun ConnectedHomeScreen(
     var showForceLocalDisconnectDialog by remember { mutableStateOf(false) }
     var showDeleteServerDialog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var statusTone by remember { mutableStateOf(BadgeTone.NEUTRAL) }
     var hasInitialSyncCompleted by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
@@ -231,8 +232,21 @@ fun ConnectedHomeScreen(
         syncServiceState(next, snap)
         scope.launch {
             when (val res = authRepository.reconcileAndSyncSharingSettings(next, snap)) {
-                is RepoResult.Success -> Unit
-                is RepoResult.Failure -> statusMessage = "Saved locally; server sync pending (${res.message})"
+                is RepoResult.Success -> {
+                    if (statusTone == BadgeTone.ERROR) {
+                        statusMessage = null
+                        statusTone = BadgeTone.NEUTRAL
+                    }
+                }
+                is RepoResult.Failure -> {
+                    if (res.code == "DEVICE_REVOKED") {
+                        context.stopService(Intent(context, LocationSharingService::class.java))
+                        onDisconnected()
+                    } else {
+                        statusTone = BadgeTone.ERROR
+                        statusMessage = "Server sync failed — saved locally only (${res.message})"
+                    }
+                }
             }
         }
     }
@@ -256,9 +270,11 @@ fun ConnectedHomeScreen(
             val effectiveDesired = if (pendingUsageEnableAfterSettings) {
                 pendingUsageEnableAfterSettings = false
                 if (updatedSnap.usageAccessGranted) {
-                    statusMessage = "Usage Access granted. Daily App Usage sharing enabled."
+                    statusTone = BadgeTone.NEUTRAL
+                    statusMessage = "Usage Access granted. Daily App Usage consent enabled."
                     stored.copy(usageEnabled = true)
                 } else {
+                    statusTone = BadgeTone.WARNING
                     statusMessage = "Usage Access was not granted. Daily App Usage remains OFF."
                     stored.copy(usageEnabled = false)
                 }
@@ -267,6 +283,7 @@ fun ConnectedHomeScreen(
                     (stored.locationEnabled && !updatedSnap.foregroundLocationGranted) ||
                         (stored.usageEnabled && !updatedSnap.usageAccessGranted)
                 if (permissionLost) {
+                    statusTone = BadgeTone.WARNING
                     statusMessage = "An Android permission was revoked in Settings. Related sharing was turned OFF."
                 }
                 stored
@@ -275,7 +292,15 @@ fun ConnectedHomeScreen(
             syncServiceState(effectiveDesired, updatedSnap)
             when (val res = authRepository.reconcileAndSyncSharingSettings(effectiveDesired, updatedSnap)) {
                 is RepoResult.Success -> hasInitialSyncCompleted = true
-                is RepoResult.Failure -> statusMessage = "Saved locally; server sync pending (${res.message})"
+                is RepoResult.Failure -> {
+                    if (res.code == "DEVICE_REVOKED") {
+                        context.stopService(Intent(context, LocationSharingService::class.java))
+                        onDisconnected()
+                    } else {
+                        statusTone = BadgeTone.ERROR
+                        statusMessage = "Server sync failed — saved locally only (${res.message})"
+                    }
+                }
             }
         }
     }
@@ -307,6 +332,7 @@ fun ConnectedHomeScreen(
                     showBackgroundGuideDialog = true
                 }
             } else {
+                statusTone = BadgeTone.WARNING
                 statusMessage = "Location permission was denied. Location sharing remains OFF."
                 applyAndSyncSettings(stored.copy(locationEnabled = false, persistentLocationFgsEnabled = false), updatedSnap)
             }
@@ -333,6 +359,7 @@ fun ConnectedHomeScreen(
             if (granted || updatedSnap.notificationsGranted) {
                 applyAndSyncSettings(stored.copy(persistentLocationFgsEnabled = true), updatedSnap)
             } else {
+                statusTone = BadgeTone.WARNING
                 statusMessage = "Notifications permission is required before starting visible Foreground Location mode."
             }
         }
@@ -370,7 +397,7 @@ fun ConnectedHomeScreen(
                     session.isRevoked -> "Disconnected / Revoked"
                     persistedSettings.globalPaused -> "Sharing Paused by You"
                     !anyCategoryOn -> "All Categories Off (Not Sharing)"
-                    else -> "Consent Active (Scheduled WorkManager)"
+                    else -> "Sharing permissions enabled — reporting not yet implemented"
                 },
                 tone = when {
                     session.isRevoked -> BadgeTone.ERROR
@@ -461,7 +488,7 @@ fun ConnectedHomeScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("Visible Foreground Location Mode", style = MaterialTheme.typography.bodyLarge)
                                 Text(
-                                    "Optional user-controlled mode with a persistent notification and Stop button.",
+                                    "Optional user-controlled mode with a persistent notification and Stop button (location capture begins in Phase 4).",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -548,7 +575,7 @@ fun ConnectedHomeScreen(
             }
 
             statusMessage?.let {
-                StatusBadge(label = it, tone = BadgeTone.NEUTRAL)
+                StatusBadge(label = it, tone = statusTone)
             }
 
             OutlinedButton(
@@ -668,8 +695,14 @@ fun ConnectedHomeScreen(
                     showDeleteServerDialog = false
                     scope.launch {
                         when (val res = authRepository.deleteOwnServerHistory()) {
-                            is RepoResult.Success -> statusMessage = "Deleted ${res.value.serverDeletedCount} server records."
-                            is RepoResult.Failure -> statusMessage = res.message
+                            is RepoResult.Success -> {
+                                statusTone = BadgeTone.POSITIVE
+                                statusMessage = "Deleted ${res.value.serverDeletedCount} server records."
+                            }
+                            is RepoResult.Failure -> {
+                                statusTone = BadgeTone.ERROR
+                                statusMessage = res.message
+                            }
                         }
                     }
                 }) {
@@ -699,6 +732,7 @@ fun ConnectedHomeScreen(
                         when (val res = authRepository.disconnectOwnDevice()) {
                             is RepoResult.Success -> onDisconnected()
                             is RepoResult.Failure -> {
+                                statusTone = BadgeTone.ERROR
                                 statusMessage = res.message
                                 showForceLocalDisconnectDialog = true
                             }
@@ -717,9 +751,9 @@ fun ConnectedHomeScreen(
     if (showForceLocalDisconnectDialog) {
         AlertDialog(
             onDismissRequest = { showForceLocalDisconnectDialog = false },
-            title = { Text("Server Unreachable While Disconnecting") },
+            title = { Text("Server Unreachable — Revocation Unverified") },
             text = {
-                Text("Could not reach the server to notify it immediately (${statusMessage ?: "offline"}). You can clear local credentials now to stop sharing and leave the group on this phone.")
+                Text("Could not reach the server to revoke this device immediately (${statusMessage ?: "offline"}). You can clear local credentials now to stop local sharing, though server-side revocation could not be confirmed until online.")
             },
             confirmButton = {
                 TextButton(onClick = {
@@ -729,7 +763,7 @@ fun ConnectedHomeScreen(
                         onDisconnected()
                     }
                 }) {
-                    Text("Disconnect Locally")
+                    Text("Clear Local Credentials")
                 }
             },
             dismissButton = {

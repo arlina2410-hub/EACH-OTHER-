@@ -46,6 +46,44 @@ export async function sha256Hex(input: string): Promise<string> {
   return toHex(new Uint8Array(digest));
 }
 
+export type ProtectedCodeDomain = 'recovery-v1' | 'device-invite-v1' | 'admin-pair-v1';
+
+export const MIN_CODE_PEPPER_BYTES = 16;
+
+export function assertValidCodePepper(pepper: string | undefined): string {
+  const trimmed = pepper?.trim() ?? '';
+  if (trimmed.length < MIN_CODE_PEPPER_BYTES) {
+    throw new Error('MISSING_OR_WEAK_CODE_HASH_PEPPER');
+  }
+  return trimmed;
+}
+
+export async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    textEncoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, textEncoder.encode(message));
+  return toHex(new Uint8Array(sig));
+}
+
+/**
+ * Computes a server-peppered domain-separated HMAC-SHA-256 digest for recovery codes
+ * and invitations. Fails closed if the server pepper secret is missing or too short.
+ */
+export async function hmacSha256CodeDigest(
+  pepper: string | undefined,
+  domain: ProtectedCodeDomain,
+  normalizedCode: string
+): Promise<string> {
+  const validPepper = assertValidCodePepper(pepper);
+  const hex = await hmacSha256Hex(validPepper, `${domain}:${normalizedCode}`);
+  return `hmac-v1:${hex}`;
+}
+
 export function canonicalChallengeMessage(params: {
   challengeId: string;
   accountId: string;

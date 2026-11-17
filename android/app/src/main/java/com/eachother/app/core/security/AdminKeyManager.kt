@@ -1,13 +1,31 @@
 package com.eachother.app.core.security
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
+
+enum class KeySecurityLevel {
+    STRONGBOX_HARDWARE,
+    TEE_HARDWARE,
+    SOFTWARE,
+    UNKNOWN
+}
+
+data class KeyHardwareStatus(
+    val keyId: String,
+    val exists: Boolean,
+    val securityLevel: KeySecurityLevel,
+    val isInsideSecureHardware: Boolean,
+    val summary: String
+)
 
 /**
  * Pure JVM helper for converting Android Keystore's ASN.1 DER ECDSA P-256 signature
@@ -58,16 +76,108 @@ object EcdsaSignatureCodec {
     }
 }
 
+/**
+ * Pure JVM helper translating Android KeyInfo fields into explicit, honest hardware backing status.
+ * Uses KeyProperties.SECURITY_LEVEL_* numeric constants (API 31+):
+ *   2 = SECURITY_LEVEL_STRONGBOX
+ *   1 = SECURITY_LEVEL_TRUSTED_ENVIRONMENT
+ *   0 = SECURITY_LEVEL_SOFTWARE
+ */
+object KeySecurityLevelMapper {
+    const val SDK_INT_API_31 = 31
+    const val SECURITY_LEVEL_SOFTWARE = 0
+    const val SECURITY_LEVEL_TRUSTED_ENVIRONMENT = 1
+    const val SECURITY_LEVEL_STRONGBOX = 2
+
+    fun mapKeyInfoSecurityLevel(
+        keyId: String,
+        exists: Boolean,
+        sdkInt: Int,
+        securityLevelConst: Int?,
+        isInsideSecureHardwareFlag: Boolean?
+    ): KeyHardwareStatus {
+        if (!exists) {
+            return KeyHardwareStatus(
+                keyId = keyId,
+                exists = false,
+                securityLevel = KeySecurityLevel.UNKNOWN,
+                isInsideSecureHardware = false,
+                summary = "No local Keystore key present for '$keyId'."
+            )
+        }
+
+        if (sdkInt >= SDK_INT_API_31 && securityLevelConst != null) {
+            return when (securityLevelConst) {
+                SECURITY_LEVEL_STRONGBOX -> KeyHardwareStatus(
+                    keyId = keyId,
+                    exists = true,
+                    securityLevel = KeySecurityLevel.STRONGBOX_HARDWARE,
+                    isInsideSecureHardware = true,
+                    summary = "StrongBox hardware-backed ECDSA P-256 key"
+                )
+                SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> KeyHardwareStatus(
+                    keyId = keyId,
+                    exists = true,
+                    securityLevel = KeySecurityLevel.TEE_HARDWARE,
+                    isInsideSecureHardware = true,
+                    summary = "Hardware-backed (TEE) ECDSA P-256 key"
+                )
+                SECURITY_LEVEL_SOFTWARE -> KeyHardwareStatus(
+                    keyId = keyId,
+                    exists = true,
+                    securityLevel = KeySecurityLevel.SOFTWARE,
+                    isInsideSecureHardware = false,
+                    summary = "Software-backed Android Keystore key (not hardware-isolated)"
+                )
+                else -> KeyHardwareStatus(
+                    keyId = keyId,
+                    exists = true,
+                    securityLevel = KeySecurityLevel.UNKNOWN,
+                    isInsideSecureHardware = false,
+                    summary = "Android Keystore key security level could not be verified"
+                )
+            }
+        }
+
+        return when (isInsideSecureHardwareFlag) {
+            true -> KeyHardwareStatus(
+                keyId = keyId,
+                exists = true,
+                securityLevel = KeySecurityLevel.TEE_HARDWARE,
+                isInsideSecureHardware = true,
+                summary = "Hardware-backed secure environment ECDSA P-256 key"
+            )
+            false -> KeyHardwareStatus(
+                keyId = keyId,
+                exists = true,
+                securityLevel = KeySecurityLevel.SOFTWARE,
+                isInsideSecureHardware = false,
+                summary = "Software-backed Android Keystore key (not hardware-isolated)"
+            )
+            null -> KeyHardwareStatus(
+                keyId = keyId,
+                exists = true,
+                securityLevel = KeySecurityLevel.UNKNOWN,
+                isInsideSecureHardware = false,
+                summary = "Android Keystore key security level could not be verified"
+            )
+        }
+    }
+}
+
 interface AdminKeySigner {
     fun ensureKeyPair(keyId: String): String
-    fun rotateKeyPair(keyId: String): String
+    fun generateCandidateKeyPair(keyId: String): String
+    fun deleteKeyPair(keyId: String)
     fun getPublicKeySpki(keyId: String): String?
     fun signCanonicalChallenge(keyId: String, canonicalPayload: String): String
+    fun inspectKeyHardwareStatus(keyId: String): KeyHardwareStatus
 }
 
 /**
- * Hardware-backed Android Keystore ECDSA P-256 (secp256r1) key manager.
+ * Android Keystore ECDSA P-256 (secp256r1) key manager.
  * Private keys never leave Android Keystore; only X.509 SPKI public keys are exported.
+ * Supports non-destructive candidate key generation so failed recovery or pairing never destroys the active key.
  */
 class AndroidKeystoreAdminKeyManager : AdminKeySigner {
 
@@ -79,13 +189,25 @@ class AndroidKeystoreAdminKeyManager : AdminKeySigner {
         return generateKeyPairInternal(fullAlias(keyId))
     }
 
-    override fun rotateKeyPair(keyId: String): String {
+    override fun generateCandidateKeyPair(keyId: String): String {
         val alias = fullAlias(keyId)
         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         if (ks.containsAlias(alias)) {
             ks.deleteEntry(alias)
         }
         return generateKeyPairInternal(alias)
+    }
+
+    override fun deleteKeyPair(keyId: String) {
+        try {
+            val alias = fullAlias(keyId)
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (ks.containsAlias(alias)) {
+                ks.deleteEntry(alias)
+            }
+        } catch (_: Exception) {
+            // Best-effort cleanup of unused candidate or retired keys
+        }
     }
 
     override fun getPublicKeySpki(keyId: String): String? {
@@ -113,6 +235,51 @@ class AndroidKeystoreAdminKeyManager : AdminKeySigner {
         return Base64.encodeToString(p1363, Base64.NO_WRAP)
     }
 
+    override fun inspectKeyHardwareStatus(keyId: String): KeyHardwareStatus {
+        return try {
+            val alias = fullAlias(keyId)
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            val privateKey = ks.getKey(alias, null) as? PrivateKey
+                ?: return KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+                    keyId = keyId,
+                    exists = false,
+                    sdkInt = Build.VERSION.SDK_INT,
+                    securityLevelConst = null,
+                    isInsideSecureHardwareFlag = null
+                )
+
+            val factory = KeyFactory.getInstance(privateKey.algorithm, ANDROID_KEYSTORE)
+            val keyInfo = factory.getKeySpec(privateKey, KeyInfo::class.java)
+            val levelConst = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                keyInfo.securityLevel
+            } else {
+                null
+            }
+            @Suppress("DEPRECATION")
+            val insideHardware = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                keyInfo.isInsideSecureHardware
+            } else {
+                null
+            }
+
+            KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+                keyId = keyId,
+                exists = true,
+                sdkInt = Build.VERSION.SDK_INT,
+                securityLevelConst = levelConst,
+                isInsideSecureHardwareFlag = insideHardware
+            )
+        } catch (_: Exception) {
+            KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+                keyId = keyId,
+                exists = true,
+                sdkInt = Build.VERSION.SDK_INT,
+                securityLevelConst = null,
+                isInsideSecureHardwareFlag = null
+            )
+        }
+    }
+
     private fun generateKeyPairInternal(alias: String): String {
         val generator = KeyPairGenerator.getInstance(
             KeyProperties.KEY_ALGORITHM_EC,
@@ -133,6 +300,6 @@ class AndroidKeystoreAdminKeyManager : AdminKeySigner {
     companion object {
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val ALIAS_PREFIX = "each_other_admin_ecdsa_"
-        const val ACTIVE_ADMIN_KEY_ID = "primary_v1"
+        const val DEFAULT_LEGACY_KEY_ID = "primary_v1"
     }
 }

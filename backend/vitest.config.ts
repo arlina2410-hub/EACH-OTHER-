@@ -13,6 +13,7 @@ export default defineConfig(async () => {
         miniflare: {
           bindings: {
             JWT_SIGNING_SECRET: 'test-only-jwt-signing-secret-at-least-32-bytes-long',
+            CODE_HASH_PEPPER: 'test-only-code-hash-pepper-at-least-32-bytes-long',
             TEST_MIGRATIONS: migrations,
           },
         },

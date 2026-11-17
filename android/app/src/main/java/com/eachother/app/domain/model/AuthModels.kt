@@ -18,7 +18,8 @@ enum class AppRole {
 data class LocalAdminIdentity(
     val email: String,
     val adminDeviceId: String,
-    val groupName: String? = null
+    val groupName: String? = null,
+    val activeKeyId: String = "primary_v1"
 )
 
 @Serializable
@@ -27,6 +28,8 @@ data class AuthSession(
     val accountId: String? = null,
     val adminDeviceId: String? = null,
     val adminEmail: String? = null,
+    val activeAdminKeyId: String? = null,
+    val pendingAdminKeyId: String? = null,
     val deviceId: String? = null,
     val groupId: String? = null,
     val groupName: String? = null,

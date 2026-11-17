@@ -1,4 +1,9 @@
-import { generateInviteCode, normalizeCode, sha256Hex } from '../crypto/crypto';
+import {
+  generateInviteCode,
+  hmacSha256CodeDigest,
+  normalizeCode,
+  sha256Hex,
+} from '../crypto/crypto';
 import { AppError } from '../http/errors';
 import type { Env } from '../types/env';
 import { issueSessionTokens } from './authService';
@@ -7,13 +12,36 @@ export function formatInviteCode(raw12: string): string {
   return `${raw12.slice(0, 4)}-${raw12.slice(4, 8)}-${raw12.slice(8, 12)}`;
 }
 
+async function computeInviteTokenDigests(env: Env, normalizedCode: string) {
+  let primaryDigest: string;
+  try {
+    primaryDigest = await hmacSha256CodeDigest(
+      env.CODE_HASH_PEPPER,
+      'device-invite-v1',
+      normalizedCode
+    );
+  } catch {
+    throw new AppError(500, 'SERVER_MISCONFIGURED', 'Required code hashing secret is not configured.');
+  }
+
+  const allowLegacy = env.ALLOW_LEGACY_UNPEPPERED_CODES === 'true';
+  const legacyDigest = allowLegacy ? await sha256Hex(normalizedCode) : null;
+  return { primaryDigest, legacyDigest };
+}
+
 export async function createInvitation(
   env: Env,
   params: { groupId: string; accountId: string; label?: string; ttlMinutes: number },
   nowMs: number = Date.now()
 ) {
   const rawCode = generateInviteCode(12);
-  const tokenHash = await sha256Hex(rawCode);
+  let tokenHash: string;
+  try {
+    tokenHash = await hmacSha256CodeDigest(env.CODE_HASH_PEPPER, 'device-invite-v1', rawCode);
+  } catch {
+    throw new AppError(500, 'SERVER_MISCONFIGURED', 'Required code hashing secret is not configured.');
+  }
+
   const invitationId = crypto.randomUUID();
   const expiresAtMs = nowMs + params.ttlMinutes * 60 * 1000;
 
@@ -72,6 +100,41 @@ export async function revokeInvitation(
   return { invitationId, revokedAtMs: nowMs };
 }
 
+async function lookupInvitationRow(env: Env, normalizedCode: string) {
+  const { primaryDigest, legacyDigest } = await computeInviteTokenDigests(env, normalizedCode);
+
+  const selectQuery = `SELECT i.id, i.group_id, i.expires_at_ms, i.used_at_ms, i.revoked_at_ms, g.name AS group_name
+     FROM invitations i
+     JOIN groups g ON g.id = i.group_id
+     WHERE i.token_hash = ? AND g.status = 'ACTIVE'`;
+
+  const row = await env.DB.prepare(selectQuery)
+    .bind(primaryDigest)
+    .first<{
+      id: string;
+      group_id: string;
+      expires_at_ms: number;
+      used_at_ms: number | null;
+      revoked_at_ms: number | null;
+      group_name: string;
+    }>();
+
+  if (row || !legacyDigest) {
+    return row;
+  }
+
+  return env.DB.prepare(selectQuery)
+    .bind(legacyDigest)
+    .first<{
+      id: string;
+      group_id: string;
+      expires_at_ms: number;
+      used_at_ms: number | null;
+      revoked_at_ms: number | null;
+      group_name: string;
+    }>();
+}
+
 export async function validateInvitation(
   env: Env,
   inviteCode: string,
@@ -79,24 +142,11 @@ export async function validateInvitation(
 ) {
   const normalized = normalizeCode(inviteCode);
   if (normalized.length !== 12) {
+    await computeInviteTokenDigests(env, normalized); // Ensure missing secret still fails closed
     throw new AppError(404, 'INVITATION_INVALID', 'Invitation is invalid, expired, or no longer active.');
   }
-  const tokenHash = await sha256Hex(normalized);
 
-  const row = await env.DB.prepare(
-    `SELECT i.id, i.expires_at_ms, i.used_at_ms, i.revoked_at_ms, g.name AS group_name
-     FROM invitations i
-     JOIN groups g ON g.id = i.group_id
-     WHERE i.token_hash = ? AND g.status = 'ACTIVE'`
-  )
-    .bind(tokenHash)
-    .first<{
-      id: string;
-      expires_at_ms: number;
-      used_at_ms: number | null;
-      revoked_at_ms: number | null;
-      group_name: string;
-    }>();
+  const row = await lookupInvitationRow(env, normalized);
 
   if (!row || row.used_at_ms !== null || row.revoked_at_ms !== null || row.expires_at_ms <= nowMs) {
     throw new AppError(404, 'INVITATION_INVALID', 'Invitation is invalid, expired, or no longer active.');
@@ -116,25 +166,11 @@ export async function enrollDevice(
 ) {
   const normalized = normalizeCode(input.inviteCode);
   if (normalized.length !== 12) {
+    await computeInviteTokenDigests(env, normalized);
     throw new AppError(404, 'INVITATION_INVALID', 'Invitation is invalid, expired, or no longer active.');
   }
-  const tokenHash = await sha256Hex(normalized);
 
-  const invite = await env.DB.prepare(
-    `SELECT i.id, i.group_id, i.expires_at_ms, i.used_at_ms, i.revoked_at_ms, g.name AS group_name
-     FROM invitations i
-     JOIN groups g ON g.id = i.group_id
-     WHERE i.token_hash = ? AND g.status = 'ACTIVE'`
-  )
-    .bind(tokenHash)
-    .first<{
-      id: string;
-      group_id: string;
-      expires_at_ms: number;
-      used_at_ms: number | null;
-      revoked_at_ms: number | null;
-      group_name: string;
-    }>();
+  const invite = await lookupInvitationRow(env, normalized);
 
   if (!invite || invite.used_at_ms !== null || invite.revoked_at_ms !== null || invite.expires_at_ms <= nowMs) {
     throw new AppError(404, 'INVITATION_INVALID', 'Invitation is invalid, expired, or no longer active.');
@@ -159,7 +195,6 @@ export async function enrollDevice(
 
   const inviteUpdateChanges = results[1]?.meta.changes ?? 0;
   if (inviteUpdateChanges !== 1) {
-    // Concurrent enrollment consumed the single-use invite; clean up newly inserted device
     await env.DB.prepare('DELETE FROM devices WHERE id = ?').bind(deviceId).run();
     throw new AppError(404, 'INVITATION_INVALID', 'Invitation is invalid, expired, or no longer active.');
   }

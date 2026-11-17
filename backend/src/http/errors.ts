@@ -2,7 +2,8 @@ export class AppError extends Error {
   constructor(
     public readonly status: number,
     public readonly code: string,
-    message: string
+    message: string,
+    public readonly extra?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'AppError';
@@ -28,6 +29,7 @@ export function errorResponse(err: unknown): Response {
           code: err.code,
           message: err.message,
         },
+        ...(err.extra ?? {}),
       },
       err.status
     );

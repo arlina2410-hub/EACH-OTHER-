@@ -39,8 +39,24 @@ export async function parseJsonBody<T extends z.ZodTypeAny>(
   return result.data;
 }
 
+const IPV4_REGEX =
+  /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+const IPV6_REGEX = /^[0-9a-fA-F:]{2,45}$/;
+
+export function isValidIpAddress(candidate: string): boolean {
+  if (IPV4_REGEX.test(candidate)) return true;
+  if (candidate.includes(':') && IPV6_REGEX.test(candidate)) return true;
+  return false;
+}
+
+/**
+ * Derives the rate-limit client IP strictly from Cloudflare's edge-overwritten
+ * CF-Connecting-IP header (never client-supplied X-Forwarded-For / Forwarded / X-Real-IP).
+ */
 export function getClientIpKey(request: Request): string {
-  const cfIp = request.headers.get('cf-connecting-ip');
-  const forwarded = request.headers.get('x-forwarded-for');
-  return (cfIp ?? forwarded?.split(',')[0]?.trim() ?? 'local').slice(0, 64);
+  const cfIp = request.headers.get('cf-connecting-ip')?.trim();
+  if (cfIp && isValidIpAddress(cfIp)) {
+    return cfIp.toLowerCase();
+  }
+  return 'unverified-client';
 }

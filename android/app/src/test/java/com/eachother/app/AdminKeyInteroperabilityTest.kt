@@ -1,7 +1,10 @@
 package com.eachother.app
 
 import com.eachother.app.core.security.EcdsaSignatureCodec
+import com.eachother.app.core.security.KeySecurityLevel
+import com.eachother.app.core.security.KeySecurityLevelMapper
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -89,5 +92,69 @@ class AdminKeyInteroperabilityTest {
             0x02, 0x01, 0x01
         )
         assertNull(EcdsaSignatureCodec.derToP1363(nonMinimal))
+    }
+
+    @Test
+    fun `maps KeyInfo security levels accurately without false hardware-backed claims`() {
+        val strongBox = KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+            keyId = "k1",
+            exists = true,
+            sdkInt = 34,
+            securityLevelConst = KeySecurityLevelMapper.SECURITY_LEVEL_STRONGBOX,
+            isInsideSecureHardwareFlag = null
+        )
+        assertEquals(KeySecurityLevel.STRONGBOX_HARDWARE, strongBox.securityLevel)
+        assertTrue(strongBox.isInsideSecureHardware)
+
+        val tee = KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+            keyId = "k1",
+            exists = true,
+            sdkInt = 34,
+            securityLevelConst = KeySecurityLevelMapper.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
+            isInsideSecureHardwareFlag = null
+        )
+        assertEquals(KeySecurityLevel.TEE_HARDWARE, tee.securityLevel)
+        assertTrue(tee.isInsideSecureHardware)
+
+        val software = KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+            keyId = "k1",
+            exists = true,
+            sdkInt = 34,
+            securityLevelConst = KeySecurityLevelMapper.SECURITY_LEVEL_SOFTWARE,
+            isInsideSecureHardwareFlag = null
+        )
+        assertEquals(KeySecurityLevel.SOFTWARE, software.securityLevel)
+        assertFalse(software.isInsideSecureHardware)
+
+        val legacyHardware = KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+            keyId = "k1",
+            exists = true,
+            sdkInt = 29,
+            securityLevelConst = null,
+            isInsideSecureHardwareFlag = true
+        )
+        assertEquals(KeySecurityLevel.TEE_HARDWARE, legacyHardware.securityLevel)
+        assertTrue(legacyHardware.isInsideSecureHardware)
+
+        val legacySoftware = KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+            keyId = "k1",
+            exists = true,
+            sdkInt = 29,
+            securityLevelConst = null,
+            isInsideSecureHardwareFlag = false
+        )
+        assertEquals(KeySecurityLevel.SOFTWARE, legacySoftware.securityLevel)
+        assertFalse(legacySoftware.isInsideSecureHardware)
+
+        val unknownOrMissing = KeySecurityLevelMapper.mapKeyInfoSecurityLevel(
+            keyId = "missing",
+            exists = false,
+            sdkInt = 34,
+            securityLevelConst = null,
+            isInsideSecureHardwareFlag = null
+        )
+        assertEquals(KeySecurityLevel.UNKNOWN, unknownOrMissing.securityLevel)
+        assertFalse(unknownOrMissing.exists)
+        assertFalse(unknownOrMissing.isInsideSecureHardware)
     }
 }

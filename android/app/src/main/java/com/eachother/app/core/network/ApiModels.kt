@@ -175,6 +175,14 @@ data class UpdateSharingSettingsRequest(
 )
 
 @Serializable
+data class EffectiveSharingDto(
+    val globalPaused: Boolean = false,
+    val locationActive: Boolean = false,
+    val usageActive: Boolean = false,
+    val deviceStatusActive: Boolean = false
+)
+
+@Serializable
 data class UpdateSharingSettingsResponse(
     val deviceId: String,
     val deviceStatus: String,
@@ -186,7 +194,14 @@ data class UpdateSharingSettingsResponse(
     val usagePermissionState: String,
     val backgroundRestricted: Boolean,
     val settingsVersion: Int,
-    val updatedAtMs: Long
+    val updatedAtMs: Long,
+    val effectiveSharing: EffectiveSharingDto? = null
+)
+
+@Serializable
+data class SettingsConflictEnvelope(
+    val error: ApiErrorBody,
+    val authoritativeSettings: UpdateSharingSettingsResponse? = null
 )
 
 @Serializable
@@ -283,7 +298,16 @@ data class DeletionRequestDto(
 data class DeletionResponseDto(
     val commandId: String,
     val serverDeletedCount: Int,
-    val deviceDeletionStatus: String
+    val deviceDeletionStatus: String,
+    val localWipeGuaranteed: Boolean? = null
+)
+
+@Serializable
+data class AdminDisconnectDeviceResponse(
+    val deviceId: String,
+    val status: String,
+    val revokedAtMs: Long,
+    val deletionResult: DeletionResponseDto? = null
 )
 
 @Serializable

@@ -72,5 +72,5 @@ interface EachOtherApi {
     suspend fun disconnectDevice(
         @Path("deviceId") deviceId: String,
         @Body body: Map<String, Boolean>
-    )
+    ): AdminDisconnectDeviceResponse
 }

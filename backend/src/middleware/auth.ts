@@ -15,8 +15,12 @@ export async function authenticateRequest(request: Request, env: Env): Promise<A
   }
 
   const session = await env.DB.prepare(
-    `SELECT id, subject_type, account_id, admin_device_id, device_id, group_id, revoked_at_ms, expires_at_ms
-     FROM auth_sessions WHERE id = ?`
+    `SELECT s.id, s.subject_type, s.account_id, s.admin_device_id, s.device_id, s.group_id,
+            s.revoked_at_ms, s.expires_at_ms,
+            f.revoked_at_ms AS family_revoked_at_ms
+     FROM auth_sessions s
+     LEFT JOIN auth_session_families f ON f.id = s.family_id
+     WHERE s.id = ?`
   )
     .bind(payload.sessionId)
     .first<{
@@ -28,12 +32,14 @@ export async function authenticateRequest(request: Request, env: Env): Promise<A
       group_id: string;
       revoked_at_ms: number | null;
       expires_at_ms: number;
+      family_revoked_at_ms: number | null;
     }>();
 
   if (
     !session ||
     session.subject_type !== payload.role ||
     session.revoked_at_ms !== null ||
+    session.family_revoked_at_ms !== null ||
     session.expires_at_ms <= Date.now()
   ) {
     throw new AppError(401, 'SESSION_REVOKED', 'Session is no longer valid.');

@@ -53,6 +53,7 @@ import com.eachother.app.core.network.CreateInvitationResponse
 import com.eachother.app.core.network.InvitationSummaryDto
 import com.eachother.app.core.network.RegisteredAdminDeviceDto
 import com.eachother.app.core.network.StorageQuotaResponse
+import com.eachother.app.core.security.KeySecurityLevel
 import com.eachother.app.data.repository.AuthRepository
 import com.eachother.app.data.repository.RepoResult
 import com.eachother.app.domain.model.AuthSession
@@ -163,8 +164,8 @@ fun AdminAuthScreen(
             when (tabIndex) {
                 0 -> {
                     InfoBanner(
-                        title = "Hardware-key security (No password)",
-                        body = "This phone creates an unexportable ECDSA P-256 key inside Android Keystore and gives you 10 one-time recovery codes."
+                        title = "Android Keystore ECDSA Sign-In (No Password)",
+                        body = "This phone generates an unexportable ECDSA P-256 key inside Android Keystore and gives you 10 one-time recovery codes."
                     )
                     OutlinedTextField(
                         value = email,
@@ -423,6 +424,20 @@ fun AdminDashboardScreen(
                     "Connected devices share only categories the owner explicitly turns on after reviewing Android disclosures.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            item {
+                val keyStatus = remember(session.activeAdminKeyId, session.localAdminIdentity?.activeKeyId) {
+                    authRepository.getActiveAdminKeyHardwareStatus(session)
+                }
+                StatusBadge(
+                    label = keyStatus.summary,
+                    tone = when (keyStatus.securityLevel) {
+                        KeySecurityLevel.STRONGBOX_HARDWARE, KeySecurityLevel.TEE_HARDWARE -> BadgeTone.POSITIVE
+                        KeySecurityLevel.SOFTWARE -> BadgeTone.WARNING
+                        KeySecurityLevel.UNKNOWN -> BadgeTone.NEUTRAL
+                    }
                 )
             }
 
@@ -735,7 +750,12 @@ fun AdminDashboardScreen(
                     scope.launch {
                         when (val res = authRepository.disconnectConnectedDeviceByAdmin(target.id, wipe)) {
                             is RepoResult.Success -> {
-                                infoNotice = "Disconnected ${target.display_name}."
+                                val del = res.value.deletionResult
+                                infoNotice = if (del != null) {
+                                    "Disconnected ${target.display_name}. Deleted ${del.serverDeletedCount} server record(s); phone-local copy wipe unverified (${del.deviceDeletionStatus})."
+                                } else {
+                                    "Disconnected ${target.display_name} and revoked its session."
+                                }
                                 refreshAll()
                             }
                             is RepoResult.Failure -> error = res.message

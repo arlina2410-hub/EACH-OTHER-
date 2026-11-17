@@ -1,47 +1,38 @@
 # TEST_PLAN.md — EACH OTHER
 
-**Phase:** Phase 0 — Verification & Acceptance Criteria  
+**Phase:** Phase 2.1 — Security, Reliability & Build Verification  
 **Source of Truth:** `PRD.md` §13
 
 ---
 
 ## 1. Automated Backend Test Suite (`backend/test/` via Vitest + Miniflare/D1)
 
-Every backend phase requires automated tests running against a real local D1 SQLite instance before sign-off:
-1. **Auth & Crypto:** Password hashing/verification, JWT signing/expiry, refresh token rotation, refresh token reuse revocation, recovery code single-use consumption.
-2. **Authorization & Isolation:**
-   - Connected device calling any `/v1/admin/*` route -> `403 FORBIDDEN`.
-   - Admin A requesting Admin B's devices, locations, usage, status, or deletions -> `404 DEVICE_NOT_FOUND`.
-   - Connected device attempting to spoof another `deviceId` in payload -> server uses JWT `deviceId` only.
-3. **Invitations:** Valid code passes; expired/used/revoked code fails with uniform `404`; rate limit returns `429` after threshold.
-4. **Sync & Idempotency:**
-   - Batch > 50 items or > 256 KB rejected (`400`/`413`).
-   - Out-of-range latitude/longitude or future timestamps rejected per-item without crashing valid items.
-   - Re-sending identical `record_id`s returns `duplicateIds` with zero duplicate D1 rows.
-   - Partial batch handling (`acceptedIds` + `rejectedInvalid`).
-5. **Revocation & Deletion:**
-   - Revoked device receives `401 DEVICE_REVOKED` immediately on `/commands` and `/sync/batch`.
-   - Deletion command removes D1 rows, marks `sync_receipts.tombstoned = 1`, stays `PENDING_DEVICE_ACK` until `/commands/ack`.
-   - Re-uploading tombstoned record returns `rejectedTombstonedIds` and does NOT re-insert into D1.
-6. **Migrations:** Apply `0001_initial_schema.sql` cleanly from scratch on empty D1.
+Every backend phase requires automated tests running against a real local D1 SQLite instance (migrations `0001_initial_schema.sql` + `0002_phase2_1_hardening.sql`) before sign-off:
+1. **Auth, Crypto & Peppered Digests (`crypto.test.ts`, `auth_and_isolation.test.ts`, `hardening_phase2_1.test.ts`):**
+   - ECDSA P-256 SPKI + ASN.1 DER-to-P1363 verification + latency benchmark in `workerd`.
+   - Domain-separated `HMAC-SHA-256` digests (`CODE_HASH_PEPPER`), fail-closed `500 SERVER_MISCONFIGURED` when unset, and opt-in `ALLOW_LEGACY_UNPEPPERED_CODES` behavior.
+   - Single-use challenge consumption and recovery code revocation of all prior Admin devices/sessions.
+   - Atomic single-use refresh token rotation under concurrent `Promise.all` requests, session family revocation on reuse, and distinct `REFRESH_TOKEN_REUSED` / `REFRESH_TOKEN_REVOKED` / `REFRESH_TOKEN_EXPIRED` / `INVALID_REFRESH_TOKEN` errors.
+2. **Authorization, Monotonic Settings & Global Pause (`auth_and_isolation.test.ts`, `hardening_phase2_1.test.ts`):**
+   - Connected device calling any `/v1/admin/*` route -> `403 FORBIDDEN`; Admin cross-group isolation -> `404`.
+   - Out-of-order and concurrent `PUT /v1/devices/me/sharing-settings` -> `409 SETTINGS_VERSION_CONFLICT` with `authoritativeSettings`, category preference preservation across Global Pause, and derived `effectiveSharing`.
+   - `assertReportConsentAllowed`: `403 SHARING_PAUSED` when paused and `403 CATEGORY_NOT_ENABLED` when category/permission disabled, while control endpoints remain reachable.
+3. **Rate Limiting & Header Spoofing Defense (`hardening_phase2_1.test.ts`):**
+   - Atomic DB rate limiters under concurrent bursts, ignoring spoofed `x-forwarded-for`, validating `cf-connecting-ip`, and `cleanupExpiredRateLimits`.
+4. **Deletions, Tombstones & Honest Disconnect (`deletion_and_quota.test.ts`, `hardening_phase2_1.test.ts`):**
+   - Tombstones applied before deletes across all 4 scopes (`SINGLE_RECORD`, `DATE_RANGE`, `CATEGORY`, `ALL_DEVICE_DATA`), `isRecordTombstoned` safety check, ownership-enforced `/commands/ack` (`acknowledgedIds` + `rejectedCommandIds`), and honest `DEVICE_REVOKED_LOCAL_UNVERIFIED` / `localWipeGuaranteed: false` on Admin disconnect-with-wipe.
+5. **Sync & Idempotency (Scheduled for Phase 3):** `/v1/sync/batch` batching, deduplication, and live upload tombstone rejection.
 
 ---
 
 ## 2. Automated Android Test Suite (`android/app/src/test` & `androidTest`)
 
-> **Environment Note (from Phase 0 audit):** JVM unit tests and Android instrumented tests require JDK 17 + Android SDK, which are not installed in the current Node.js 22 container. They will be executed in an Android-capable environment (Android Studio / Gradle runner).
+> **Environment Note:** JVM unit tests and Android instrumented tests require JDK 17 + Android SDK, which are not installed in the current Node.js 22 container. Committed Gradle 8.9 wrapper enables direct execution in Android Studio or any JDK 17 CI runner (`./gradlew testDebugUnitTest`).
 
-1. **JVM Unit Tests (`src/test`):**
-   - Domain rules: consent toggle states, global pause blocking collection, stale-threshold classification (`<30m`, `30m–3h`, `>3h`).
-   - Sync use cases with fake API & fake clock: FIFO batching, partial ack, ambiguous retry, commands-before-upload ordering, tombstone deletion execution.
-   - `UsageAggregator` with fixture `UsageEvents` (including missing background events / crash gaps -> `PARTIAL_GAP`).
-   - `LocationCollector` & `DeviceStatusCollector` via faked platform sources.
-   - ViewModel state transitions (`Loading`, `Empty`, `Error`, `PermissionDenied`, `Offline`).
-   - `MockWebServer` integration tests for Retrofit DTO serialization & OkHttp `TokenAuthenticator` refresh flow.
-2. **Android Instrumented Tests (`src/androidTest`):**
-   - Room DAO CRUD, unique constraints, and `MigrationTestHelper` schema upgrades.
-   - WorkManager `TestListenableWorkerBuilder` constraint & retry behavior.
-   - Compose UI tests (`createComposeRule`) verifying Role Selection, Consent Disclosure defaults (all OFF), Pause toggle, and Stale banner text.
+1. **JVM Unit Tests Implemented (`src/test`):**
+   - `AdminKeyInteroperabilityTest`: 50-signature real `secp256r1` ASN.1 DER -> 64-byte IEEE P1363 round-trips + `KeySecurityLevelMapper` assertions across StrongBox, TEE, Software, API 26–30, and unknown/missing states.
+   - `AuthRepositoryTest`: Admin registration (`activeKeyId`), non-destructive `recoverAdmin` preserving old key/session on server failure, `TokenAuthenticator` single-refresh coordination across concurrent 401s with `MockWebServer`, `reconcileAndSyncSharingSettings` `409` reconciliation, honest offline disconnect messaging, and `DEVICE_REVOKED_LOCAL_UNVERIFIED` response parsing.
+2. **Scheduled for Phase 3–7 (`src/test` & `src/androidTest`):** Room DAOs/migrations, WorkManager `TestListenableWorkerBuilder`, offline outbox queue & sync use cases, `UsageAggregator`, and Compose UI instrumented tests.
 
 ---
 
