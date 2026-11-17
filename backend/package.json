@@ -1,0 +1,22 @@
+{
+  "name": "each-other-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:migrate:local": "wrangler d1 migrations apply each-other-db --local"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.8.4",
+    "@cloudflare/workers-types": "^4.20260405.0",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.2",
+    "wrangler": "^4.164.0"
+  }
+}
